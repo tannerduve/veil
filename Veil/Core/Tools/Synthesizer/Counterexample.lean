@@ -3,6 +3,7 @@ module
 public meta import Veil
 public meta import Veil.Core.Tools.Synthesizer.Certificate
 public meta import Veil.Core.Tools.Synthesizer.Model
+public meta import Veil.Core.Tools.Synthesizer.Tactic
 public import Veil.Core.Tools.Synthesizer.Soundness
 
 /-!
@@ -29,8 +30,8 @@ at the model's sort sizes and typeclass instances.
   `decide`. The transition system receives each instance by its binder name, since two instances of
   one class at sorts of the same size are both instances at `Fin n`.
 * The facts the execution needs (the assumptions, the initial state, each step, the violation) are
-  theorems proven by evaluation, and `ic3_unsafe` applies `Veil.Synthesizer.unsafe_of_path`.
-  Nothing rests on the solver.
+  theorems proven by evaluation (`veil_concrete`), and `ic3_unsafe` applies
+  `RelationalTransitionSystem.not_invariant_of_reachable`. Nothing rests on the solver.
 -/
 
 public meta section
@@ -176,51 +177,6 @@ def fieldValue (className field : Name) (rows : Array (Array Nat)) : FieldSpec �
 
 end CexCtx
 
-/-- Split every variable of an enumeration type (an inductive type whose constructors take no
-arguments, such as the concrete type of an enum sort) into its constructors. A Veil action decides
-equality at an enum sort through the enum's class, which neither `decide` nor `simp` evaluates
-while the compared value is a variable. -/
-elab "veil_enum_cases" : tactic => do
-  let rec split : MVarId → Nat → MetaM (List MVarId)
-  | g, 0 => pure [g]
-  | g, fuel + 1 => g.withContext do
-    for d in ← getLCtx do
-      if d.isImplementationDetail then continue
-      let .const n _ := (← whnf d.type).getAppFn | continue
-      let some (.inductInfo info) := (← getEnv).find? n | continue
-      unless info.numParams == 0 && info.numIndices == 0 && info.ctors.length > 1 do continue
-      let nullary ← info.ctors.allM fun ctor ↦ do
-        match (← getEnv).find? ctor with
-        | some (.ctorInfo ci) => pure (ci.numFields == 0)
-        | _ => pure false
-      unless nullary do continue
-      let cases ← g.cases d.fvarId
-      return (← cases.toList.mapM fun sub ↦ split sub.mvarId fuel).flatten
-    return [g]
-  Lean.Elab.Tactic.liftMetaTactic fun g ↦ split g 64
-
-/-- The tactic that proves a concrete fact about the module's definitions: unfold, normalize with
-Veil's simp set, then evaluate on the finite values. -/
-def concreteTactic (unfoldNames : Array Ident) (valueDefs : Array Ident) :
-    CommandElabM (TSyntax `tactic) := do
-  let nextSimp := mkIdent `nextSimp
-  `(tactic| (
-      unfold $[$unfoldNames:ident]*
-      try veil_simp +$(mkIdent `instances) only [$nextSimp:ident]
-      all_goals first
-        | decide
-        | (simp +$(mkIdent `instances) only [$[$valueDefs:ident],*]; done)
-        | (simp +$(mkIdent `instances) [$[$valueDefs:ident],*]; done)
-        | (simp +$(mkIdent `instances) only [$[$valueDefs:ident],*]; decide)
-        | (simp +$(mkIdent `instances) [$[$valueDefs:ident],*]; decide)
-        | (simp +$(mkIdent `instances) [$[$valueDefs:ident],*]; intros; veil_enum_cases <;>
-            simp_all +$(mkIdent `instances) [$[$valueDefs:ident],*]; done)
-        | (refine ⟨?_, ?_⟩ <;>
-            first
-              | decide
-              | (simp +$(mkIdent `instances) [$[$valueDefs:ident],*]; done)
-              | (funext; decide))))
-
 /-- `{ f₁ := v₁, … }`. -/
 def structInstance (fields : Array (Name × Term)) : CommandElabM Term := do
   let items ← fields.mapM fun (f, v) ↦ `(structInstField| $(mkIdent f):ident := $v)
@@ -277,7 +233,10 @@ def certifyUnsafe (mod : Veil.Module) (property : Array Term) (path : DecodedTra
   let prop ← `($propName $sortTerms* $instArgs*)
   let defs := #[thName] ++ stateNames ++ instNames ++ enumEqs
   let fact (name : Ident) (stmt : Term) (unfolds : Array Ident) : CommandElabM Unit := do
-    elabChecked (← `(command| theorem $name : $stmt := by $(← concreteTactic unfolds defs):tactic))
+    elabChecked (← `(command| theorem $name : $stmt := by
+      unfold $[$unfolds:ident]*
+      try veil_simp +$(mkIdent `instances) only [$(mkIdent `nextSimp):ident]
+      all_goals veil_concrete [$defs,*]))
   let rtsName := mkIdent (mod.name ++ assembledRTSName)
   let hasName := mkIdent `ic3_cex_assumptions
   fact hasName (← `(term| ($rts).$(mkIdent `assumptions) $thName))
@@ -285,28 +244,22 @@ def certifyUnsafe (mod : Veil.Module) (property : Array Term) (path : DecodedTra
   let initName := mkIdent `ic3_cex_init
   fact initName (← `(term| ($rts).$(mkIdent `init) $thName $(stateNames[0]!)))
     #[rtsName, mkIdent (mod.name ++ `Init)]
-  let mut stepNames : Array Ident := #[]
-  let mut stepPairs : Array Term := #[]
+  let mut reach ← `(.init _ $hasName $initName)
   for i in [1:path.states.size] do
     let lbl ← c.labelTerm path.labels[i]!
     let stepName := mkIdent (.mkSimple s!"ic3_cex_step_{i - 1}")
     let step ← `(term| ($rts).$(mkIdent `tr) $thName $(stateNames[i - 1]!) $lbl $(stateNames[i]!))
     fact stepName step #[rtsName, mkIdent (mod.name ++ `Next)]
-    stepNames := stepNames.push stepName
-    stepPairs := stepPairs.push (← `(($lbl, $(stateNames[i]!))))
+    reach ← `(.step _ _ $reach (Exists.intro $lbl $stepName))
   let badName := mkIdent `ic3_cex_bad
   fact badName (← `(¬ ($prop) $thName $(stateNames.back!))) #[propName]
   let thmName := mkIdent `ic3_unsafe
   let (th, st) := (mkIdent `th, mkIdent `st)
-  let validProof : Term ← match stepNames.size with
-    | 0 => `((by simp only [Veil.Synthesizer.pathValid]))
-    | 1 => `((by simp only [Veil.Synthesizer.pathValid, and_true]; exact $(stepNames[0]!)))
-    | _ => `((by simp only [Veil.Synthesizer.pathValid, and_true]; exact ⟨$[$stepNames:ident],*⟩))
   elabChecked (← `(command|
     theorem $thmName : ¬ (∀ ($th : @$(mkIdent theoryName) $sortTerms*) ($st : $stateT),
         ($rts).$(mkIdent `reachable) $th $st → ($prop) $th $st) :=
-      Veil.Synthesizer.unsafe_of_path ($rts) ($prop) $thName $(stateNames[0]!) [$stepPairs,*]
-        $hasName $initName $validProof (by simp only [Veil.Synthesizer.pathLast]; exact $badName)))
+      Veil.RelationalTransitionSystem.not_invariant_of_reachable (sys := $rts) (p := $prop) $reach
+        $badName))
   liftCoreM <| certificateResult (mod.name ++ thmName.getId) (mod.name ++ propName.getId)
 
 end Veil.Synthesizer

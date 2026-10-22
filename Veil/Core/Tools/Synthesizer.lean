@@ -31,7 +31,7 @@ public import Veil.Core.Tools.Synthesizer
 * `Query`, `TrNorm`, `Solver`: the solver queries and Veil's pipeline that discharges them.
 * `Search`, `Generalize`, `Controller`: the UPDR loop.
 * `Soundness`: the facts about transition systems the certificates apply.
-* `Certificate`, `Counterexample`: the certificates.
+* `Tactic`, `Certificate`, `Counterexample`: the certificates.
 * `Command`: the command.
 
 ## References

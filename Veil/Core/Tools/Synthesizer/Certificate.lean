@@ -28,7 +28,7 @@ At a fixpoint the search has clauses `c₁ … cₖ` such that `Inv = p₁ ∧ �
   `tr`, it is `Mod.ic3_cons_i_tr`. A step no form replays is taken on the solver's word as
   `Mod.ic3_init_i_trusted` or `Mod.ic3_cons_i_trusted`, and the command reports `sorryAx`.
 * `Mod.ic3_inv` and `Mod.ic3_prop` are the conjunctions of the wrapped predicates, and `ic3_safe`
-  applies `Veil.Synthesizer.property_of_certificate`. Consecution
+  applies `RelationalTransitionSystem.invariant_of_inductive` and `Invariant.mono`. Consecution
   matches on the label: each action's case instantiates the queries' `ActionTag` with the module's
   tag type and rewrites `tr` to the normalized relation along `Mod.ic3_tr_eq_norm`.
 * The transition system is Veil's `relationalTransitionSystem`: its initial states run `after_init`
@@ -300,9 +300,9 @@ def certify (mod : Veil.Module) (property : Array Term) (clauses : Array Clause)
   elabChecked (← `(command|
     theorem $thmName $(ctx.sortBinders ++ ctx.typeclassBinders)* : ∀ ($th : $(ctx.theoryT))
         ($st : $(ctx.stateT)), ($rts).$(mkIdent `reachable) $th $st → $propName $sorts* $th $st :=
-      Veil.Synthesizer.property_of_certificate ($rts) ($invName $sorts*) ($propName $sorts*)
+      (Veil.RelationalTransitionSystem.invariant_of_inductive (sys := $rts) (p := $invName $sorts*)
         (fun $th $s $has $hinit ↦ $initProof)
-        (fun $th $s $lbl $s' $has $hInv $htr ↦ $consProof)
+        (fun $th $s $lbl $s' $has $hInv $htr ↦ $consProof)).mono (q := $propName $sorts*)
         (fun $th $st $hInv ↦ $propProof)))
   liftCoreM <| certificateResult (mod.name ++ thmName.getId) (mod.name ++ invName.getId)
 
