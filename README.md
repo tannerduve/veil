@@ -49,6 +49,10 @@ These files are also available in the [online playground](#online-playground), u
 An explanation of the constructs of the Veil DSL can be found at
 [`docs/DSL-Reference.md`](docs/DSL-Reference.md). 
 
+[`docs/Invariant-Synthesis.md`](docs/Invariant-Synthesis.md) describes
+`#synthesize_invariants`, which finds inductive invariants (or
+counterexamples) automatically and certifies them as Lean theorems.
+
 ## Build
 
 Install the system dependencies for your platform, then follow the shared setup
