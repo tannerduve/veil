@@ -290,9 +290,8 @@ Each run ends with `#synthesize_invariants certify`.
 - **Speed.** Small models take seconds to minutes. Ring and Peterson take
   about 35 minutes. Most of the time goes to preparing queries, not solving
   them: Ring spent 1,375 s on Veil and lean-smt preprocessing and 641 s in the
-  solver. Reconstructing the solver's proofs instead of trusting them changed
-  Ring's time by only about 13%. Ring and Peterson ran next to other builds, so their times
-  are high.
+  solver. Ring and Peterson ran next to other builds, so their times are
+  high.
 - **Counterexample certificates prove each step by evaluation on concrete
   values.** A step that evaluation and the enum case split cannot close
   reports the violation with no theorem.
