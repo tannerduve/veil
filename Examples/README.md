@@ -49,4 +49,6 @@ lake lean Examples/Tutorial/Ring.lean
 
 - File names use PascalCase (e.g., `TwoPhaseCommit.lean`)
 - Each file declares a `veil module` matching the file name
-- Each file imports only `Veil`
+- Each file imports only `Veil`, except the `*Synthesis.lean` files, which also
+  import `Veil.Core.Tools.Synthesizer` to run `#synthesize_invariants` on a copy
+  of the example of the same name
