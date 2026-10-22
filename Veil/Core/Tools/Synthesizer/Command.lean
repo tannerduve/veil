@@ -8,16 +8,14 @@ public meta import Veil.Core.Tools.Synthesizer.Counterexample
 /-!
 # `#synthesize_invariants`
 
-Runs UPDR on the current Veil module's `safety` clauses (and, with
-`(invariants := true)`, its declared `invariant`s) and prints the outcome:
-strengthening clauses ready to paste into the module as `invariant [ic3_k] …`
-declarations, a concrete counterexample, an abstract counterexample showing
-that no universal invariant exists (a verdict, not a Lean theorem), or the
-reason the search stopped.
+This file defines the command, which runs UPDR on the current module's `safety` properties and
+reports the outcome: strengthening clauses to paste into the module, a concrete counterexample, an
+abstract counterexample showing that no universal inductive invariant exists, or why the search
+stopped. With `certify`, an invariant or a counterexample becomes a kernel-checked theorem.
 
-Options may appear in any order, each at most once:
-`#synthesize_invariants (fuel := 500) (log := "run.jsonl") (invariants := true) verbose certify`,
-`#synthesize_invariants (expect := unsafe)` for a module with a planted bug.
+    #synthesize_invariants (fuel := 500) (log := "run.jsonl") (invariants := true) verbose certify
+
+Options may appear in any order, each at most once.
 -/
 
 public meta section
@@ -30,10 +28,6 @@ register_option veil.synthesizer.timings : Bool := {
   descr := "report separate wall times for IC3 synthesis and kernel certification"
 }
 
-private def reportPhaseTime (phase : String) (started : Nat) : CommandElabM Unit := do
-  if veil.synthesizer.timings.get (← getOptions) then
-    logInfo s!"IC3 timing {phase}: {(← IO.monoMsNow) - started} ms"
-
 syntax synthFuel := &"fuel" " := " num
 syntax synthLog := &"log" " := " str
 syntax synthExpectKind := &"invariant" <|> &"unsafe" <|> &"no_universal_invariant" <|> &"unknown"
@@ -41,323 +35,344 @@ syntax synthExpect := &"expect" " := " synthExpectKind
 syntax synthInvariants := &"invariants" " := " (&"true" <|> &"false")
 syntax synthGeneralizer := &"generalizer" " := " (&"updr" <|> &"linear")
 syntax synthCores := &"cores" " := " (&"true" <|> &"false")
-syntax synthOpt := "(" (synthFuel <|> synthLog <|> synthExpect <|> synthInvariants <|> synthGeneralizer <|> synthCores) ")"
-syntax (name := synthesizeInvariants) "#synthesize_invariants" (synthOpt <|> &"verbose" <|> &"certify")* : command
+syntax synthOpt := "(" (synthFuel <|> synthLog <|> synthExpect <|> synthInvariants <|>
+  synthGeneralizer <|> synthCores) ")"
+/-- Search for universal invariants that make the module's `safety` properties inductive, with
+UPDR. -/
+syntax (name := synthesizeInvariants)
+  "#synthesize_invariants" (synthOpt <|> &"verbose" <|> &"certify")* : command
 
-/-- The verdict a test expects from the command (`(expect := …)`). -/
+/-- The outcome a test expects (`(expect := …)`). -/
 inductive Expectation where
   | invariant | «unsafe» | noUniversalInvariant | unknown
 deriving BEq, Repr
 
+/-- An expectation in words. -/
 def Expectation.describe : Expectation → String
   | .invariant => "an inductive invariant"
   | .«unsafe» => "a counterexample"
   | .noUniversalInvariant => "the no-universal-invariant verdict"
   | .unknown => "a stopped run"
 
+/-- Whether an outcome is the one expected. -/
 def Expectation.matches : Expectation → Outcome → Bool
   | .invariant, .foundInvariant .. => true
   | .«unsafe», .«unsafe» _ => true
   | .noUniversalInvariant, .noUniversalInvariant .. => true
-  | .unknown, .unknown .. => true
-  | .unknown, .absenceWithheld .. => true
+  | .unknown, .unknown .. | .unknown, .absenceWithheld .. => true
   | _, _ => false
 
+/-- An outcome in words. -/
 def Outcome.describe : Outcome → String
   | .foundInvariant .. => "an inductive invariant"
   | .«unsafe» _ => "a counterexample"
   | .unsafeUndecoded .. => "a violation whose execution could not be decoded"
   | .noUniversalInvariant .. => "the no-universal-invariant verdict"
-  | .unknown .. => "a stopped run"
-  | .absenceWithheld .. => "a stopped run"
+  | .unknown .. | .absenceWithheld .. => "a stopped run"
   | .internalError .. => "an internal error"
 
-/-- The `outcome` field of the log file's `outcome` event. -/
-def outcomeJson : Outcome → Json
-  | .foundInvariant frame clauses _ => Json.mkObj [("kind", "invariant"), ("frame", (frame : Nat)),
-      ("clauses", toJson (clauses.map fun a => clauseJson a.clause))]
+/-- The outcome as the log's `outcome` event reports it. -/
+def Outcome.toJson : Outcome → Json
+  | .foundInvariant frame clauses _ => Json.mkObj [("kind", "invariant"), ("frame", frame),
+      ("clauses", Lean.toJson (clauses.map (clauseJson ·.clause)))]
   | .«unsafe» p => Json.mkObj [("kind", "unsafe"), ("steps", (p.states.size - 1 : Nat))]
   | .unsafeUndecoded k r => Json.mkObj [("kind", "unsafe"), ("steps", k), ("reason", r)]
-  | .noUniversalInvariant ds _ => Json.mkObj [("kind", "no_universal_invariant"), ("diagrams", (ds.size : Nat))]
-  | .absenceWithheld ds _ _ => Json.mkObj [("kind", "unknown"), ("reason", absenceWithheldReason), ("diagrams", (ds.size : Nat))]
+  | .noUniversalInvariant ds _ =>
+    Json.mkObj [("kind", "no_universal_invariant"), ("diagrams", ds.size)]
+  | .absenceWithheld ds _ _ =>
+    Json.mkObj [("kind", "unknown"), ("reason", absenceWithheldReason), ("diagrams", ds.size)]
   | .unknown r _ => Json.mkObj [("kind", "unknown"), ("reason", r)]
   | .internalError m _ => Json.mkObj [("kind", "internal_error"), ("message", m)]
 
-/-- Render a state as `symbol: {tuples}` lines. A Boolean individual or a
-0-ary class predicate prints as `true` or `false`; a relation as its tuples,
-`∅` when empty; a function as `args ↦ value` rows, a constant as its value.
-Elements of an enum sort print as their constructors, an enum sort as its
-constructor list. -/
-private def renderState (σ : FinStructure) : String :=
-  let sorts := String.intercalate ", " (σ.sorts.toList.map fun (s, n) =>
-    match σ.enums.find? (·.1 == s) with
-    | some (_, ctors) => s!"{s} = \{{String.intercalate ", " (ctors.toList.map toString)}}"
-    | none => s!"{s} = Fin {n}")
-  let els (sym : RelSym) (t : Array Nat) : List String :=
-    ((sym.argSorts.zip t).map fun (s, i) => σ.elementName s i).toList
-  let rels := σ.rels.toList.map fun (sym, tuples) =>
-    let table :=
-      if sym.isFunction then
-        String.intercalate " " (tuples.toList.map fun t =>
-          let names := els sym t
-          let value := names.getLast?.getD "?"
-          let args := names.dropLast
-          if args.isEmpty then value else "(" ++ String.intercalate "," args ++ ")↦" ++ value)
-      else if sym.argSorts.isEmpty then (if tuples.isEmpty then "false" else "true")
-      else if tuples.isEmpty then "∅"
-      else String.intercalate " " (tuples.toList.map fun t => "(" ++ String.intercalate "," (els sym t) ++ ")")
-    s!"    {sym.key}: {table}"
-  let nums := σ.nums.toList.map fun (sym, table) =>
-    let rows := table.toList.map fun (t, v) =>
-      let args := ((sym.argSorts.pop.zip t).map fun (s, i) => σ.elementName s i).toList
-      if args.isEmpty then toString v else "(" ++ String.intercalate "," args ++ ")↦" ++ toString v
-    s!"    {sym.key}: {String.intercalate " " rows}"
-  s!"    sorts: {sorts}\n" ++ String.intercalate "\n" (rels ++ nums)
+/-- The options of a run of the command. -/
+structure Options where
+  cfg : Config := {}
+  expectation : Option Expectation := none
+  certify : Bool := false
 
-/-- The action name in a decoded transition label (`{"act": {…}}` or `"act"`). -/
-private def actionOfLabel (j : Json) : Option String :=
-  match j with
-  | .str s => some s
-  | .obj kvs => match kvs.toArray with
-    | #[(k, _)] => some k
-    | _ => none
+/-- The word of a bare flag, which parses as an atom or a node around one. -/
+def flag? : Syntax → Option String
+  | .atom _ v | .node _ _ #[.atom _ v] => some v
   | _ => none
 
-/-- Milliseconds as `s.d` seconds. -/
-private def seconds (ms : Nat) : String := s!"{ms / 1000}.{(ms % 1000) / 100}"
+/-- Set one option; return its key and the new options. -/
+def Options.set (opts : Options) (arg : Syntax) : CommandElabM (String × Options) := do
+  let inner := if arg.isOfKind ``synthOpt then arg[1] else arg
+  match flag? inner with
+  | some "verbose" => return ("verbose", { opts with cfg.verbose := true })
+  | some "certify" => return ("certify", { opts with certify := true })
+  | some _ => throwErrorAt arg "unknown option"
+  | none => pure ()
+  match inner with
+  | `(synthFuel| fuel := $n:num) => return ("fuel", { opts with cfg.fuel := n.getNat })
+  | `(synthLog| log := $s:str) =>
+    if s.getString.isEmpty then throwErrorAt s "the log file path is empty"
+    return ("log", { opts with cfg.logFile := some (System.FilePath.mk s.getString) })
+  | `(synthExpect| expect := invariant) =>
+    return ("expect", { opts with expectation := some .invariant })
+  | `(synthExpect| expect := unsafe) =>
+    return ("expect", { opts with expectation := some .«unsafe» })
+  | `(synthExpect| expect := no_universal_invariant) =>
+    return ("expect", { opts with expectation := some .noUniversalInvariant })
+  | `(synthExpect| expect := unknown) =>
+    return ("expect", { opts with expectation := some .unknown })
+  | `(synthInvariants| invariants := true) =>
+    return ("invariants", { opts with cfg.useDeclaredInvariants := true })
+  | `(synthInvariants| invariants := false) =>
+    return ("invariants", { opts with cfg.useDeclaredInvariants := false })
+  | `(synthGeneralizer| generalizer := updr) =>
+    return ("generalizer", { opts with cfg.generalizer := .updr })
+  | `(synthGeneralizer| generalizer := linear) =>
+    return ("generalizer", { opts with cfg.generalizer := .linear })
+  | `(synthCores| cores := true) => return ("cores", { opts with cfg.cores := true })
+  | `(synthCores| cores := false) => return ("cores", { opts with cfg.cores := false })
+  | _ => throwErrorAt arg "unknown option"
 
-/-- Strengthening-clause counts per frame, for the stopped and error messages. -/
-private def frameSummary (sizes : Array Nat) : String :=
-  if sizes.isEmpty then "no frame opened"
-  else s!"{sizes.size} frame(s) opened; strengthening clauses per frame F₁ … F_{sizes.size}: {sizes}"
-
-/-- What the structures of an abstract counterexample are, for its messages. -/
-private def chainDescription : String :=
-  "the first is contained in an initial state, each next in a successor of a state containing the previous, and a successor of a state containing the last violates the property"
-
-/-- The line after "Certified": what the theorem's axioms say. -/
-private def certificateStatus (cert : CertificateResult) : String :=
-  if cert.kernelChecked then "kernel-checked, standard axioms only"
-  else
-    let note := if cert.offenders.contains ``sorryAx then "; sorryAx means a solver step could not be replayed as a Lean proof (lean-smt could not reconstruct it, or the kernel rejected its reconstruction)" else ""
-    s!"depends on {cert.offenders} beyond the standard axioms{note}"
-
-@[command_elab synthesizeInvariants]
-def elabSynthesizeInvariants : CommandElab := fun stx => do
-  let mod ← getCurrentModule (errMsg := "#synthesize_invariants must be used inside a Veil module")
-  mod.throwIfSpecNotFinalized
-  let mut fuel : Nat := ({} : Config).fuel
-  let mut logFile : Option System.FilePath := none
-  -- `(expect := …)` turns the expected verdict into a plain message and any
-  -- other outcome into an error, for regression tests.
-  let mut expectation : Option Expectation := none
-  let mut useDeclaredInvariants := false
-  let mut generalizer : GeneralizerKind := .linear
-  let mut cores := true
-  let mut verbose := false
-  let mut doCertify := false
+/-- Parse the options of the command; each may be given once. -/
+def parseOptions (args : Array Syntax) : CommandElabM Options := do
+  let mut opts : Options := {}
   let mut seen : Array String := #[]
-  for arg in stx[1].getArgs do
-    let inner := if arg.isOfKind ``synthOpt then arg[1] else arg
-    let mut key := ""
-    -- A bare flag parses as a `token.<flag>` node around the atom.
-    let flag? : Option String := match inner with
-      | .atom _ v => some v
-      | .node _ _ #[.atom _ v] => some v
-      | _ => none
-    if let some flag := flag? then
-      key := flag
-      match flag with
-      | "verbose" => verbose := true
-      | "certify" => doCertify := true
-      | _ => throwErrorAt arg "unknown option"
-    else
-      match inner with
-      | `(synthFuel| fuel := $n:num) => key := "fuel"; fuel := n.getNat
-      | `(synthLog| log := $s:str) =>
-        key := "log"
-        let path := s.getString
-        if path.isEmpty then throwErrorAt s "the log file path is empty"
-        logFile := some (System.FilePath.mk path)
-      | `(synthExpect| expect := invariant) => key := "expect"; expectation := some .invariant
-      | `(synthExpect| expect := unsafe) => key := "expect"; expectation := some .«unsafe»
-      | `(synthExpect| expect := no_universal_invariant) => key := "expect"; expectation := some .noUniversalInvariant
-      | `(synthExpect| expect := unknown) => key := "expect"; expectation := some .unknown
-      | `(synthInvariants| invariants := true) => key := "invariants"; useDeclaredInvariants := true
-      | `(synthInvariants| invariants := false) => key := "invariants"; useDeclaredInvariants := false
-      | `(synthGeneralizer| generalizer := updr) => key := "generalizer"; generalizer := .updr
-      | `(synthGeneralizer| generalizer := linear) => key := "generalizer"; generalizer := .linear
-      | `(synthCores| cores := true) => key := "cores"; cores := true
-      | `(synthCores| cores := false) => key := "cores"; cores := false
-      | _ => throwErrorAt arg "unknown option"
+  for arg in args do
+    let (key, opts') ← opts.set arg
     if seen.contains key then throwErrorAt arg "the option {key} is given twice"
     seen := seen.push key
-  let cfg : Config := { fuel, verbose, logFile, useDeclaredInvariants, generalizer, cores }
-  -- Rejections first: a module outside the supported shapes, or without a
-  -- property, gets its error and no message about a run. The vocabulary is
-  -- computed once here, for the search and for the verdict messages.
-  let sig ← liftTermElabM (Signature.ofModule mod)
-  let property ← liftCoreM (checkedProperty mod cfg)
-  -- A value of a fault hook it does not define is an error of the command.
-  let _ ← liftCoreM QueryCtx.failNormalizeAt
-  let _ ← liftCoreM failQueryAt
-  -- What the verdict is about: the `safety` clauses, those plus the declared
-  -- invariants, or the declared invariants alone when the module has no `safety`.
-  let propertyName :=
-    if mod.safeties.isEmpty then "the declared invariants"
-    else if useDeclaredInvariants then "the safety property together with the declared invariants"
-    else "the safety property"
-  -- The transition system does not assume `trusted invariant`s; a refutation
-  -- may run through states they exclude.
-  let trustedNote := if mod.trustedInvariants.isEmpty then "" else " (trusted invariants were not assumed)"
-  -- A module holds one certificate; refuse before the search rather than after.
-  if doCertify then throwIfCertified mod [`ic3_prop, `ic3_safe, `ic3_unsafe, `ic3_init_0]
-  -- The names of the normalized transition relation are reserved as well; a
-  -- declaration of another origin under them is refused, not used.
-  liftCoreM (QueryCtx.throwIfTrNormForeign mod)
-  let trNormBefore := (← liftCoreM (QueryCtx.trNormAvailable mod)).isSome
-  -- Initial states of the transition system keep `default` for these
-  -- components; `#check_invariants` proves initiation from any pre-state.
-  let unassigned := Signature.unassignedByInit mod
-  unless unassigned.isEmpty do
-    logWarning s!"IC3: after_init does not assign {", ".intercalate (unassigned.map toString).toList}; the certificate's initial states keep the default value of these components, and #check_invariants may reject a clause that relies on it (see \"Semantics\" in docs/Invariant-Synthesis.md)"
-  let synthesisStarted ← IO.monoMsNow
-  let result ← liftTermElabM <| synthesize mod cfg sig
-  reportPhaseTime "synthesis" synthesisStarted
-  let outcome := result.outcome
-  let stats := result.stats
+    opts := opts'
+  return opts
+
+/-! ### Messages -/
+
+/-- Milliseconds as seconds, `s.d`. -/
+def seconds (ms : Nat) : String := s!"{ms / 1000}.{(ms % 1000) / 100}"
+
+/-- The strengthening clauses per frame. -/
+def frameSummary (sizes : Array Nat) : String :=
+  if sizes.isEmpty then "no frame opened"
+  else
+    s!"{sizes.size} frame(s) opened; strengthening clauses per frame F₁ … F_{sizes.size}: {sizes}"
+
+/-- What the structures of an abstract counterexample are. -/
+def chainDescription : String :=
+  "the first is contained in an initial state, each next in a successor of a state containing the \
+    previous, and a successor of a state containing the last violates the property"
+
+/-- The structures of an abstract counterexample, one block each. -/
+def renderChain (diagrams : Array FinStructure) : String :=
+  "".intercalate (diagrams.toList.zipIdx.map fun (σ, i) ↦ s!"  structure {i + 1}:\n{σ.render}\n")
+
+/-- What the axioms of a certificate say. -/
+def certificateStatus (cert : CertificateResult) : String :=
+  if cert.kernelChecked then "kernel-checked, standard axioms only"
+  else
+    let note := if cert.offenders.contains ``sorryAx then "; sorryAx means a solver step could \
+      not be replayed as a Lean proof (lean-smt could not reconstruct it, or the kernel rejected \
+      its reconstruction)" else ""
+    s!"depends on {cert.offenders} beyond the standard axioms{note}"
+
+/-- The report of the solver calls of a run. -/
+def statsMessage (stats : RunStats) (status : TrNorm.Status) : String :=
   let ph := stats.phases
-  -- What the run did about the normalized transition relation.
-  let trNormStatus ← liftCoreM (QueryCtx.trNormStatus mod trNormBefore)
-  let trNormNote := match trNormStatus with
+  let note := match status with
     | .normalized => s!"; transition relation normalized once in {seconds ph.normalizeMs} s"
     | .reused => "; transition relation reused from an earlier run in this module"
-    | .failed => s!"; transition relation not normalized{if ph.normalizeMs > 0 then s!" ({seconds ph.normalizeMs} s spent on the attempt)" else ""}, the queries were written with Veil's `tr`"
+    | .failed => s!"; transition relation not normalized{if ph.normalizeMs > 0 then
+        s!" ({seconds ph.normalizeMs} s spent on the attempt)" else ""}, the queries were written \
+        with Veil's `tr`"
     | .off => "; transition relation not normalized (veil.synthesizer.normalizeTr false)"
     | .unused => ""
-  logInfo s!"solver calls: {stats.solverCalls}, {seconds stats.solverMs} s (preprocessing {seconds ph.preprocessMs} s, elaboration {seconds ph.elabMs} s, solving {seconds ph.smtMs} s, decoding {seconds ph.decodeMs} s){trNormNote}"
+  s!"solver calls: {stats.solverCalls}, {seconds stats.solverMs} s (preprocessing \
+    {seconds ph.preprocessMs} s, elaboration {seconds ph.elabMs} s, solving {seconds ph.smtMs} s, \
+    decoding {seconds ph.decodeMs} s){note}"
+
+/-- The report of an invariant. -/
+def invariantMessage (frame : Nat) (clauses : Array Admitted) (anyTrusted trusting : Bool) :
+    String :=
+  let trustNote :=
+    if !anyTrusted then " (lean-smt reconstructed every solver answer of the search as a proof \
+      term; the search does not kernel-check those terms, `certify` does)"
+    else if trusting then " (the search took the solver's answers on faith under \
+      `veil.synthesizer.trust true`; a certificate reconstructs its own proofs)"
+    else " (the search took some solver answers on faith because lean-smt could not replay their \
+      proofs; a certificate reconstructs its own proofs and reports what it cannot)"
+  if clauses.isEmpty then
+    s!"Inductive invariant found at frame {frame}: the property is inductive on its own{trustNote}"
+  else
+    s!"Inductive invariant found at frame {frame} with {clauses.size} strengthening \
+      clause(s){trustNote}:\n" ++
+      "".intercalate (clauses.toList.zipIdx.map fun (a, k) ↦ s!"invariant [ic3_{k}] {a.clause}\n")
+
+/-- The report of a no-universal-invariant verdict. -/
+def absenceMessage (sig : Signature) (propertyName : String) (diagrams : Array FinStructure)
+    (check : BoundedCheck) : String :=
+  let ghostNote := if sig.ghosts.isEmpty then "" else
+    s!"The ghost definitions {", ".intercalate (sig.ghosts.map toString).toList} are outside \
+      that vocabulary: a clause over one of them unfolds to its body, and when the body has a \
+      quantifier the clause is not universal, so this verdict says nothing about such clauses. "
+  let excludedNote := if sig.excludedClassFields.isEmpty then "" else
+    s!"The class fields {", ".intercalate (sig.excludedClassFields.map toString).toList} are \
+      outside that vocabulary (their result type is outside the module's sorts), so this verdict \
+      says nothing about clauses over them. "
+  let basis := if sig.extendsPaper
+    then "Proposition 5.6 of the paper, extended here to function symbols and enum sorts; see \
+      docs/Invariant-Synthesis.md"
+    else "Proposition 5.6 of the paper"
+  let checkNote := match check with
+    | .noAnswer k r => s!"The bounded path check of {k} step(s) got no answer ({r.take 160}), so \
+        an execution of that length may violate the property.\n"
+    | _ => ""
+  s!"No universal inductive invariant over the module's vocabulary proves {propertyName}. \
+    {ghostNote}{excludedNote}Abstract counterexample, {diagrams.size} structure(s): \
+    {chainDescription} ({basis}).\n{renderChain diagrams}{checkNote}"
+
+/-- The report of an abstract counterexample in a module with integer state. -/
+def withheldMessage (diagrams : Array FinStructure) (check : BoundedCheck)
+    (frameSizes : Array Nat) : String :=
+  let checkNote := match check with
+    | .notAsked => "The chain starts above the initial frame, so it describes no execution of the \
+        frames' length. "
+    | .noPath k => s!"No execution of {k} step(s) violates the property, so the chain is not a \
+        real execution of that length. "
+    | .noAnswer k r => s!"The bounded path check of {k} step(s) got no answer ({r.take 160}), so a \
+        real execution of that length may exist. "
+  s!"IC3 stopped: the search closed without an invariant. The no-universal-invariant verdict is \
+    not given for a module with integer state (Proposition 5.6 of the paper is about uninterpreted \
+    sorts), so this is not a verdict. {frameSummary frameSizes}. Abstract counterexample, \
+    {diagrams.size} structure(s): {chainDescription}.\n{renderChain diagrams}{checkNote}The \
+    property may need a strengthening outside the universal fragment (a Skolem ghost function \
+    makes an existential fact universal; see \"Existential invariants\" in \
+    docs/Invariant-Synthesis.md), or it is false by a longer execution. Modeling the integer state \
+    as an ordered sort makes the no-universal-invariant verdict available for the remodeled \
+    module."
+
+/-- The report of a stopped run, with a hint that follows the reason. -/
+def stoppedMessage (reason : String) (frameSizes : Array Nat) : String :=
+  let has (marker : String) : Bool := (reason.splitOn marker).length > 1
+  let hint :=
+    if has "fuel exhausted" then
+      "Raise the budget with `(fuel := n)`. When the frontier frame keeps growing without clearing \
+        (see the clause counts), the search is not converging and more budget will not help; \
+        `(generalizer := updr)` or `(cores := false)` change which clauses are tried."
+    else if reason.startsWith "frame limit" then
+      "The frame limit is a constant of `Config`; a search that reaches it is unlikely to \
+        converge, and the property may need an invariant outside the universal fragment."
+    else if has "heartbeats" || has "exceeded its budget" then
+      "The query overran the per-query heartbeat budget (a constant of `Solver.lean`), most often \
+        in Veil's preprocessing of a large frame."
+    else if has "failed:" then
+      "A query could not be posed or its answer could not be read; this is a pipeline limitation, \
+        not a solver budget."
+    else if has solverUnknownPrefix then
+      "The query was asked twice, the second time with twice `veil.smt.timeout`; raise that \
+        option. Some modules produce queries outside the fragment cvc5 decides, and those run to \
+        the timeout however large."
+    else ""
+  s!"IC3 stopped: {reason}. {frameSummary frameSizes}.{if hint.isEmpty then "" else " " ++ hint}"
+
+/-- The report of a concrete counterexample, with a `sat trace` block that re-checks it. -/
+def violationMessage (property : Array Term) (propertyName : String) (path : DecodedTrace) :
+    CommandElabM String := do
+  let actionOf : Json → String
+    | .str s => s
+    | .obj kvs => match kvs.toArray with
+      | #[(k, _)] => k
+      | _ => "any action"
+    | _ => "any action"
+  let mut msg := s!"Violated: {propertyName}. Execution of {path.states.size - 1} step(s):\n"
+  for i in [:path.states.size] do
+    msg := msg ++ s!"  state {i}:\n{path.states[i]!.render}\n"
+    if i + 1 < path.states.size then msg := msg ++ s!"  step: {path.labels[i+1]!}\n"
+  -- Each conjunct is wrapped in `uqc%` so that its capitals are quantified inside the negation.
+  let props ← liftCoreM <| property.toList.mapM fun t ↦
+    return s!"(uqc% ({← PrettyPrinter.ppTerm t}))"
+  let stepLines := (path.labels.toList.drop 1).map fun l ↦ s!"    {actionOf l}\n"
+  return msg ++ "Re-check with:\n  sat trace [ic3_cex] {\n" ++ "".intercalate stepLines ++
+    s!"    assert ¬ ({" ∧ ".intercalate props})\n  }\n"
+
+/-! ### The command -/
+
+/-- Log a report as information when it is the expected outcome, at `severity` otherwise. -/
+def logReport (expected : Bool) (severity : MessageSeverity) (msg : String) :
+    CommandElabM Unit := do
+  logAt (← getRef) msg (if expected then .information else severity)
+
+/-- Report the wall time of a phase under `veil.synthesizer.timings`. -/
+def reportPhaseTime (phase : String) (started : Nat) : CommandElabM Unit := do
+  if veil.synthesizer.timings.get (← getOptions) then
+    logInfo s!"IC3 timing {phase}: {(← IO.monoMsNow) - started} ms"
+
+@[command_elab synthesizeInvariants]
+def elabSynthesizeInvariants : CommandElab := fun stx ↦ do
+  let mod ← getCurrentModule (errMsg := "#synthesize_invariants must be used inside a Veil module")
+  mod.throwIfSpecNotFinalized
+  let { cfg, expectation, certify := doCertify } ← parseOptions stx[1].getArgs
+  -- Refuse an unsupported module, a module without a property and a bad fault hook before running.
+  let sig ← liftTermElabM (Signature.ofModule mod)
+  let property ← liftCoreM (checkedProperty mod cfg)
+  let _ ← liftCoreM TrNorm.faultPoint
+  let _ ← liftCoreM failQueryAt
+  let propertyName :=
+    if mod.safeties.isEmpty then "the declared invariants"
+    else if cfg.useDeclaredInvariants then
+      "the safety property together with the declared invariants"
+    else "the safety property"
+  -- The transition system does not assume trusted invariants.
+  let trustedNote :=
+    if mod.trustedInvariants.isEmpty then "" else " (trusted invariants were not assumed)"
+  if doCertify then throwIfCertified mod [`ic3_prop, `ic3_safe, `ic3_unsafe, `ic3_init_0]
+  liftCoreM (TrNorm.throwIfForeign mod)
+  let trNormBefore := (← liftCoreM (TrNorm.available mod)).isSome
+  let unassigned := Signature.unassignedByInit mod
+  unless unassigned.isEmpty do
+    logWarning s!"IC3: after_init does not assign \
+      {", ".intercalate (unassigned.map toString).toList}; the certificate's initial states keep \
+      the default value of these components, and #check_invariants may reject a clause that \
+      relies on it (see \"Semantics\" in docs/Invariant-Synthesis.md)"
+  let started ← IO.monoMsNow
+  let { outcome, stats, .. } ← liftTermElabM <| synthesize mod cfg sig
+  reportPhaseTime "synthesis" started
+  let status ← liftCoreM (TrNorm.status mod trNormBefore)
+  logInfo (statsMessage stats status)
   if let some path := cfg.logFile then
+    let ph := stats.phases
     try
       appendEvent path <| Json.mkObj [("event", "outcome"), ("module", toString mod.name),
-        ("solverCalls", (stats.solverCalls : Nat)), ("solverMs", (stats.solverMs : Nat)),
-        ("preprocessMs", (ph.preprocessMs : Nat)), ("elabMs", (ph.elabMs : Nat)), ("smtMs", (ph.smtMs : Nat)),
-        ("decodeMs", (ph.decodeMs : Nat)), ("normalizeMs", (ph.normalizeMs : Nat)), ("trNorm", trNormStatus.key),
-        ("outcome", outcomeJson outcome)]
-    catch e => logWarning m!"IC3: could not append the outcome to the log file {path}: {e.toMessageData}"
-  -- `expected` says the outcome is the one a test asked for: it is then
-  -- reported as information, whatever its usual severity.
-  let expected := match expectation with
-    | some e => e.matches outcome
-    | none => false
+        ("solverCalls", stats.solverCalls), ("solverMs", stats.solverMs),
+        ("preprocessMs", ph.preprocessMs), ("elabMs", ph.elabMs), ("smtMs", ph.smtMs),
+        ("decodeMs", ph.decodeMs), ("normalizeMs", ph.normalizeMs), ("trNorm", status.key),
+        ("outcome", outcome.toJson)]
+    catch e =>
+      logWarning m!"IC3: could not append the outcome to the log file {path}: {e.toMessageData}"
+  let expected := expectation.any (·.matches outcome)
   if let some e := expectation then
-    unless e.matches outcome do
-      logError s!"expected {e.describe}, got {outcome.describe}"
+    unless expected do logError s!"expected {e.describe}, got {outcome.describe}"
+  let certifyTimed (x : CommandElabM CertificateResult) : CommandElabM CertificateResult := do
+    let started ← IO.monoMsNow
+    let cert ← x
+    reportPhaseTime "certification" started
+    return cert
   match outcome with
   | .foundInvariant frame clauses anyTrusted =>
-    -- Under `veil.synthesizer.trust true` every answer is taken on faith; under the
-    -- default an answer is trusted only when lean-smt could not replay its
-    -- proof (`runStatementCore`).
-    let trusting := veil.synthesizer.trust.get (← getOptions)
-    let trustNote := if !anyTrusted then " (lean-smt reconstructed every solver answer of the search as a proof term; the search does not kernel-check those terms, `certify` does)"
-      else if trusting then " (the search took the solver's answers on faith under `veil.synthesizer.trust true`; a certificate reconstructs its own proofs)"
-      else " (the search took some solver answers on faith because lean-smt could not replay their proofs; a certificate reconstructs its own proofs and reports what it cannot)"
-    if clauses.isEmpty then
-      logInfo s!"Inductive invariant found at frame {frame}: the property is inductive on its own{trustNote}"
-    else
-      let mut msg := s!"Inductive invariant found at frame {frame} with {clauses.size} strengthening clause(s){trustNote}:\n"
-      let mut k := 0
-      for a in clauses do
-        msg := msg ++ s!"invariant [ic3_{k}] {a.clause}\n"
-        k := k + 1
-      logInfo msg
+    logInfo (invariantMessage frame clauses anyTrusted (veil.synthesizer.trust.get (← getOptions)))
     if doCertify then
-      let certificationStarted ← IO.monoMsNow
-      let cert ← certify mod property (clauses.map (·.clause))
-      reportPhaseTime "certification" certificationStarted
-      logInfo s!"Certified: theorem {cert.theoremName} (strengthening {cert.strengtheningName}); axioms: {cert.axioms}; {certificateStatus cert}"
+      let cert ← certifyTimed <| certify mod property (clauses.map (·.clause))
+      logInfo s!"Certified: theorem {cert.theoremName} (strengthening {cert.strengtheningName}); \
+        axioms: {cert.axioms}; {certificateStatus cert}"
   | .«unsafe» path =>
-    let mut msg := s!"Violated: {propertyName}{trustedNote}. Execution of {path.states.size - 1} step(s):\n"
-    for i in [:path.states.size] do
-      msg := msg ++ s!"  state {i}:\n{renderState path.states[i]!}\n"
-      if i + 1 < path.states.size then msg := msg ++ s!"  step: {path.labels[i+1]!}\n"
-    -- The same execution as a Veil trace specification, so it can be re-checked
-    -- independently with `sat trace`. Each conjunct is wrapped in `uqc%` so
-    -- that its capitals are quantified inside the negation, as the controller
-    -- quantified them.
-    let actNames := (path.labels.toList.drop 1).map fun l => (actionOfLabel l).getD "any action"
-    let propTexts ← liftCoreM <| property.toList.mapM fun t => do
-      pure s!"(uqc% ({← PrettyPrinter.ppTerm t}))"
-    let propText := String.intercalate " ∧ " propTexts
-    msg := msg ++ "Re-check with:\n  sat trace [ic3_cex] {\n" ++
-      String.intercalate "" (actNames.map fun a => s!"    {a}\n") ++
-      s!"    assert ¬ ({propText})\n  }\n"
-    if expected then logInfo msg else logError msg
+    logReport expected .error (← violationMessage property (propertyName ++ trustedNote) path)
     if doCertify then
-      let certificationStarted ← IO.monoMsNow
-      let cert ← certifyUnsafe mod property path
-      reportPhaseTime "certification" certificationStarted
-      logInfo s!"Certified: theorem {cert.theoremName} refutes {propertyName} at the model's sort sizes and typeclass instances; axioms: {cert.axioms}; {certificateStatus cert}"
+      let cert ← certifyTimed <| certifyUnsafe mod property path
+      logInfo s!"Certified: theorem {cert.theoremName} refutes {propertyName} at the model's sort \
+        sizes and typeclass instances; axioms: {cert.axioms}; {certificateStatus cert}"
   | .unsafeUndecoded steps reason =>
-    let certifyNote := if doCertify then "; no certificate is built" else ""
-    logError s!"Violated: {propertyName}{trustedNote}. The solver found an execution of {steps} step(s) that breaks it, but its model could not be decoded ({reason.take 300}), so the execution is not shown{certifyNote}."
+    logError s!"Violated: {propertyName}{trustedNote}. The solver found an execution of {steps} \
+      step(s) that breaks it, but its model could not be decoded ({reason.take 300}), so the \
+      execution is not shown{if doCertify then "; no certificate is built" else ""}."
   | .noUniversalInvariant diagrams check =>
-    -- Ghost definitions are not symbols of the vocabulary: a clause over one
-    -- unfolds to its body, and a body with a quantifier is not universal.
-    let ghosts := Signature.ghostDefinitions mod
-    let ghostNote := if ghosts.isEmpty then "" else
-      s!"The ghost definitions {", ".intercalate (ghosts.map toString).toList} are outside that vocabulary: a clause over one of them unfolds to its body, and when the body has a quantifier the clause is not universal, so this verdict says nothing about such clauses. "
-    -- Class fields whose result type is outside the sorts are not symbols
-    -- of the vocabulary either.
-    let excluded := sig.excludedClassFields
-    let excludedNote := if excluded.isEmpty then "" else
-      s!"The class fields {", ".intercalate (excluded.map toString).toList} are outside that vocabulary (their result type is outside the module's sorts), so this verdict says nothing about clauses over them. "
-    -- The paper states Proposition 5.6 for constants and relations; the
-    -- message says when the verdict rests on the extension of it made here.
-    let basis := if sig.extendsPaper
-      then "Proposition 5.6 of the paper, extended here to function symbols and enum sorts; see docs/Invariant-Synthesis.md"
-      else "Proposition 5.6 of the paper"
-    let mut msg := s!"No universal inductive invariant over the module's vocabulary proves {propertyName}{trustedNote}. {ghostNote}{excludedNote}" ++
-      s!"Abstract counterexample, {diagrams.size} structure(s): {chainDescription} ({basis}).\n"
-    for i in [:diagrams.size] do
-      msg := msg ++ s!"  structure {i + 1}:\n{renderState diagrams[i]!}\n"
-    -- The verdict stands whatever the bounded check said, but without an
-    -- answer from it the property may be false as well.
-    if let .noAnswer k r := check then
-      msg := msg ++ s!"The bounded path check of {k} step(s) got no answer ({r.take 160}), so an execution of that length may violate the property.\n"
-    if expected then logInfo msg else logWarning msg
+    logReport expected .warning (absenceMessage sig (propertyName ++ trustedNote) diagrams check)
   | .absenceWithheld diagrams check frameSizes =>
-    -- The chain would be the absence verdict for a vocabulary without
-    -- integers; here it is shown and no verdict is given.
-    let checkNote := match check with
-      | .notAsked => "The chain starts above the initial frame, so it describes no execution of the frames' length. "
-      | .noPath k => s!"No execution of {k} step(s) violates the property, so the chain is not a real execution of that length. "
-      | .noAnswer k r => s!"The bounded path check of {k} step(s) got no answer ({r.take 160}), so a real execution of that length may exist. "
-    let mut msg := s!"IC3 stopped: the search closed without an invariant. The no-universal-invariant verdict is not given for a module with integer state (Proposition 5.6 of the paper is about uninterpreted sorts), so this is not a verdict. {frameSummary frameSizes}. " ++
-      s!"Abstract counterexample, {diagrams.size} structure(s): {chainDescription}.\n"
-    for i in [:diagrams.size] do
-      msg := msg ++ s!"  structure {i + 1}:\n{renderState diagrams[i]!}\n"
-    msg := msg ++ checkNote ++
-      "The property may need a strengthening outside the universal fragment (a Skolem ghost function makes an existential fact universal; see \"Existential invariants\" in docs/Invariant-Synthesis.md), or it is false by a longer execution. Modeling the integer state as an ordered sort makes the no-universal-invariant verdict available for the remodeled module."
-    if expected then logInfo msg else logWarning msg
-  | .unknown reason frameSizes =>
-    -- The hint follows the reason's text; every reason `SearchM.stop` is given
-    -- embeds one of the markers below or a query answer that does.
-    let has (marker : String) : Bool := (reason.splitOn marker).length > 1
-    let hint :=
-      if has "fuel exhausted" then
-        "Raise the budget with `(fuel := n)`. When the frontier frame keeps growing without clearing (see the clause counts), the search is not converging and more budget will not help; `(generalizer := updr)` or `(cores := false)` change which clauses are tried."
-      else if reason.startsWith "frame limit" then
-        "The frame limit is a constant of `Config`; a search that reaches it is unlikely to converge, and the property may need an invariant outside the universal fragment."
-      else if has "heartbeats" || has "exceeded its budget" then
-        "The query overran the per-query heartbeat budget (a constant of `Query.lean`), most often in Veil's preprocessing of a large frame."
-      else if has "failed:" then
-        "A query could not be posed or its answer could not be read; this is a pipeline limitation, not a solver budget."
-      else if has solverUnknownPrefix then
-        "The query was asked twice, the second time with twice `veil.smt.timeout`; raise that option. Some modules produce queries outside the fragment cvc5 decides, and those run to the timeout however large."
-      else ""
-    let msg := s!"IC3 stopped: {reason}. {frameSummary frameSizes}.{if hint.isEmpty then "" else " " ++ hint}"
-    if expected then logInfo msg else logWarning msg
+    logReport expected .warning (withheldMessage diagrams check frameSizes)
+  | .unknown reason frameSizes => logReport expected .warning (stoppedMessage reason frameSizes)
   | .internalError message frameSizes =>
-    logError s!"IC3 internal error: {message}. {frameSummary frameSizes}. This is a bug in the controller or in the model decoder, not a solver limit."
+    logError s!"IC3 internal error: {message}. {frameSummary frameSizes}. This is a bug in the \
+      controller or in the model decoder, not a solver limit."
 
 end Veil.Synthesizer

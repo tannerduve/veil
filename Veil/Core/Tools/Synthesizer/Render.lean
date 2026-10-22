@@ -1,23 +1,28 @@
 module
 
 public meta import Lean
-public meta import Veil.Core.Tools.Synthesizer.Clause
+public meta import Veil.Core.Tools.Synthesizer.Structure
 
 /-!
-# Rendering clauses as Veil terms
+# Rendering clauses and structures
 
-A `Clause` becomes a Lean `Term` in the surface language a Veil module user
-writes: `∀ (x0 x1 : node), ¬ leader x0 ∨ tot.le x1 x0`. State relations are
-applied directly (Veil coerces the `Bool` field to `Prop`); typeclass fields
-are written through the instance binder (`tot.le`), which is in scope both in
-a Veil module body and in the query binders `Query.lean` builds. A function
-symbol renders as the equation `curEpoch x0 = x1`, a sort-valued individual
-or class constant as `now = x0`, and an enum constructor by its name
-(`role x0 = leader`), which Veil brings into scope by opening the enum's
-class when the enum is declared, or through the class
-(`roleT_EnumClass.leader`) when the module declares the same name
-(`Signature.enumConstructors`). The same rendering therefore serves the
-solver queries and the clauses printed for the user to paste into the module.
+This file writes clauses as Veil terms, for the solver queries and the certificates, and as text,
+for the messages a user pastes into a module. It also writes finite structures as text.
+
+## Main definitions
+
+* `Veil.Synthesizer.Written`: an expression in the surface syntax of a Veil module.
+* `Veil.Synthesizer.Clause.written`: a clause as written in a module:
+  `∀ (x0 x1 : node), ¬ leader x0 ∨ tot.le x1 x0`.
+* `Veil.Synthesizer.Clause.toTerm`, `Veil.Synthesizer.Clause.toString`: its two renderings.
+* `Veil.Synthesizer.FinStructure.render`: a structure as one line per symbol.
+
+## Implementation notes
+
+A function atom is written as the equation `f x0 = x1`, a linear constraint with its negative
+coefficients moved to the right-hand side so that no subtraction is written, and an enum
+constructor by its name. Class symbols are written through the instance binder (`tot.le`), which
+is in scope both in a module and in the binders of a query.
 -/
 
 public meta section
@@ -25,105 +30,162 @@ public meta section
 namespace Veil.Synthesizer
 open Lean Lean.Parser.Term
 
-/-- Variable name for the `i`-th bound variable. -/
-def varIdent (i : Nat) : Ident := mkIdent (Name.mkSimple s!"x{i}")
+/-- An expression in the surface syntax of a Veil module, as UPDR writes it. -/
+inductive Written where
+  | ident (n : Name)
+  | app (f : Name) (args : Array Written)
+  /-- A numeral of a numeric sort; the term ascribes the sort. -/
+  | numeral (sort : SortName) (n : Int)
+  /-- `k * t`. -/
+  | scale (k : Nat) (t : Written)
+  /-- A sum of at least one term. -/
+  | sum (parts : Array Written)
+  | eq (a b : Written)
+  | le (a b : Written)
+  | not (a : Written)
+  /-- A disjunction of at least one formula. -/
+  | or (parts : Array Written)
+  | false
+  | forall (binders : Array (Name × SortName)) (body : Written)
+deriving Inhabited
 
-/-- The head of an atom as an identifier: the component name, or `inst.field`. -/
-def RelSym.headTerm (r : RelSym) : Term := mkIdent r.key
+/-- The name of the `i`-th bound variable of a clause. -/
+def varName (i : Nat) : Name := .mkSimple s!"x{i}"
 
-def Arg.toTerm : Arg → Term
-  | .var v => varIdent v
-  | .enumConst ctor _ => mkIdent ctor
+/-- The identifier of the `i`-th bound variable of a clause. -/
+def varIdent (i : Nat) : Ident := mkIdent (varName i)
 
-def NumTerm.toTerm [Monad m] [MonadQuotation m] (t : NumTerm) : m Term := do
-  let head : Term := t.sym.headTerm
-  let argTerms : Array Term := t.args.map Arg.toTerm
-  if argTerms.isEmpty then pure head else `(term| $head $argTerms*)
+namespace Written
 
-/-- A numeral of a numeric sort, `(3 : Int)`. -/
-def numeralTerm [Monad m] [MonadQuotation m] (sort : SortName) (n : Int) : m Term := do
-  let lit : Term := Syntax.mkNumLit (toString n.natAbs)
-  if n < 0 then `(term| (-$lit : $(mkIdent sort))) else `(term| ($lit : $(mkIdent sort)))
+/-- The Lean term of a written expression. -/
+partial def toTerm [Monad m] [MonadQuotation m] : Written → m Term
+  | .ident n => pure (mkIdent n)
+  | .app f args => do `($(mkIdent f) $(← args.mapM toTerm)*)
+  | .numeral s n => do
+    let lit : Term := Syntax.mkNumLit (toString n.natAbs)
+    if n < 0 then `((-$lit : $(mkIdent s))) else `(($lit : $(mkIdent s)))
+  | .scale k t => do `($(Syntax.mkNumLit (toString k)) * $(← t.toTerm))
+  | .sum ps => fold (fun a b ↦ `($a + $b)) ps
+  | .eq a b => do `($(← a.toTerm) = $(← b.toTerm))
+  | .le a b => do `($(← a.toTerm) ≤ $(← b.toTerm))
+  | .not a => do `(¬ $(← a.toTerm))
+  | .or ps => fold (fun a b ↦ `($a ∨ $b)) ps
+  | .false => `(False)
+  | .forall bs body => do
+    let binders ← bs.mapM fun (x, s) ↦ `(bracketedBinder| ($(mkIdent x) : $(mkIdent s)))
+    `(∀ $binders*, $(← body.toTerm))
+where
+  /-- Combine the terms of `ps` from the left with `op`. -/
+  fold (op : Term → Term → m Term) (ps : Array Written) : m Term := do
+    let ts ← ps.mapM toTerm
+    ts[1:].foldlM op ts[0]!
 
-/-- The two sides of a linear constraint, negative coefficients moved to the
-right so no subtraction is written: `x0 + 1 ≤ x1`, `a + b = c`. Each side is
-a sum of `k * t` (or `t` when `k = 1`) and possibly a numeral; an empty side is
-the numeral `0`. -/
-def linSides [Monad m] [MonadQuotation m] (terms : Array (Int × NumTerm)) (c : Int) : m (Term × Term) := do
-  let sort := (terms[0]?.map (·.2.sort)).getD `Int
-  let side (ts : Array (Int × NumTerm)) (k : Int) : m Term := do
-    let mut parts : Array Term := #[]
-    for (coef, t) in ts do
-      let tt ← t.toTerm
-      parts := parts.push (← if coef == 1 then pure tt else `(term| $(Syntax.mkNumLit (toString coef.natAbs)) * $tt))
-    if k > 0 then parts := parts.push (← numeralTerm sort k)
-    if parts.isEmpty then numeralTerm sort 0 else
-      parts[1:].foldlM (init := parts[0]!) fun acc p => `(term| $acc + $p)
-  let lhs ← side (terms.filter (·.1 > 0)) c
-  let rhs ← side ((terms.filter (·.1 < 0)).map fun (k, t) => (-k, t)) (-c)
-  return (lhs, rhs)
+/-- The text of a written expression. -/
+partial def toString : Written → String
+  | .ident n => n.toString
+  | .app f args => " ".intercalate (f.toString :: (args.map toString).toList)
+  | .numeral _ n => ToString.toString n
+  | .scale k t => s!"{k} * {t.toString}"
+  | .sum ps => " + ".intercalate (ps.map toString).toList
+  | .eq a b => s!"{a.toString} = {b.toString}"
+  | .le a b => s!"{a.toString} ≤ {b.toString}"
+  | .not a => s!"¬ {a.toString}"
+  | .or ps => " ∨ ".intercalate (ps.map toString).toList
+  | .false => "False"
+  | .forall bs body =>
+    s!"∀ {" ".intercalate (bs.map fun (x, s) ↦ s!"({x} : {s})").toList}, {body.toString}"
 
-def Atom.toTerm [Monad m] [MonadQuotation m] : Atom → m Term
-  | .lin terms c isEq => do
-    let (lhs, rhs) ← linSides terms c
-    if isEq then `(term| $lhs = $rhs) else `(term| $lhs ≤ $rhs)
-  | .rel sym args => do
-    let head : Term := sym.headTerm
-    let argTerms : Array Term := args.map Arg.toTerm
-    if sym.isFunction && !argTerms.isEmpty then
-      -- The graph atom `f a₁ … aₙ = b`; `b` is the last argument.
-      let fnArgs := argTerms.pop
-      let result := argTerms.back!
-      let app : Term ← if fnArgs.isEmpty then pure head else `(term| $head $fnArgs*)
-      `(term| $app = $result)
-    else if argTerms.isEmpty then pure head else `(term| $head $argTerms*)
-  | .eq a b => `(term| $(varIdent a) = $(varIdent b))
+end Written
 
-def Literal.toTerm [Monad m] [MonadQuotation m] (l : Literal) : m Term := do
-  let t ← l.atom.toTerm
-  if l.positive then pure t else `(term| ¬ $t)
+/-- An argument as written: a variable `xᵢ` or a constructor. -/
+def Arg.written : Arg → Written
+  | .var v => .ident (varName v)
+  | .enumConst ctor _ => .ident ctor
 
-/-- `∀ (x0 : s0) (x1 : s1), l0 ∨ l1 ∨ …`; an empty disjunction renders as `False`. -/
-def Clause.toTerm [Monad m] [MonadQuotation m] (c : Clause) : m Term := do
-  let lits ← c.lits.mapM Literal.toTerm
-  let body : Term ← if lits.isEmpty then `(term| False) else
-    lits[1:].foldlM (init := lits[0]!) fun acc l => `(term| $acc ∨ $l)
-  if c.vars.isEmpty then return body
-  let binders ← (Array.range c.vars.size).mapM fun i =>
-    `(bracketedBinder| ($(varIdent i) : $(mkIdent c.vars[i]!)))
-  `(term| ∀ $binders*, $body)
+/-- A symbol applied to arguments, as written. -/
+def Symbol.apply (f : Symbol) (args : Array Written) : Written :=
+  if args.isEmpty then .ident f.key else .app f.key args
 
-def Arg.toString : Arg → String
-  | .var v => s!"x{v}"
-  | .enumConst ctor _ => ctor.toString
+/-- One side of a linear constraint: the sum of `k * t` and a positive constant `c`, or the
+numeral `0` of `sort` when it is empty. -/
+def linearSide (sort : SortName) (terms : Array (Int × NumTerm)) (c : Int) : Written :=
+  let parts := terms.map fun (k, t) ↦
+    let t := t.sym.apply (t.args.map Arg.written)
+    if k == 1 then t else .scale k.natAbs t
+  let parts := if c > 0 then parts.push (.numeral sort c) else parts
+  if parts.isEmpty then .numeral sort 0 else .sum parts
 
-/-- Pretty form for messages and for pasting into a module. -/
-def Clause.toString (c : Clause) : String :=
-  let lit (l : Literal) : String :=
-    let a := match l.atom with
-      | .rel sym args =>
-        let head := sym.key.toString
-        let strs := args.map Arg.toString
-        if sym.isFunction && !strs.isEmpty then
-          let app := if strs.size == 1 then head else head ++ " " ++ " ".intercalate strs.pop.toList
-          s!"{app} = {strs.back!}"
-        else if strs.isEmpty then head else head ++ " " ++ " ".intercalate strs.toList
-      | .eq a b => s!"x{a} = x{b}"
-      | .lin terms k0 isEq =>
-        let term (t : NumTerm) : String :=
-          let strs := t.args.map Arg.toString
-          if strs.isEmpty then t.sym.key.toString else t.sym.key.toString ++ " " ++ " ".intercalate strs.toList
-        let side (ts : Array (Int × NumTerm)) (k : Int) : String :=
-          let parts := ts.map fun (coef, t) => if coef == 1 then term t else s!"{coef.natAbs} * {term t}"
-          let parts := if k > 0 then parts.push (ToString.toString k) else parts
-          if parts.isEmpty then "0" else " + ".intercalate parts.toList
-        s!"{side (terms.filter (·.1 > 0)) k0} {if isEq then "=" else "≤"} {side ((terms.filter (·.1 < 0)).map fun (k, t) => (-k, t)) (-k0)}"
-    if l.positive then a else s!"¬ {a}"
-  let body := if c.lits.isEmpty then "False" else " ∨ ".intercalate (c.lits.map lit).toList
-  if c.vars.isEmpty then body else
-    let binders := " ".intercalate ((Array.range c.vars.size).map fun i => s!"(x{i} : {c.vars[i]!})").toList
-    s!"∀ {binders}, {body}"
+/-- An atom as written. -/
+def Atom.written : Atom → Written
+  | .rel sym args =>
+    let args := args.map Arg.written
+    if sym.isFunction && !args.isEmpty then .eq (sym.apply args.pop) args.back! else sym.apply args
+  | .eq a b => .eq (.ident (varName a)) (.ident (varName b))
+  | .lin terms c isEq =>
+    let sort := (terms[0]?.map (·.2.sort)).getD `Int
+    let lhs := linearSide sort (terms.filter (·.1 > 0)) c
+    let rhs := linearSide sort ((terms.filter (·.1 < 0)).map fun (k, t) ↦ (-k, t)) (-c)
+    if isEq then .eq lhs rhs else .le lhs rhs
+
+/-- A literal as written. -/
+def Literal.written (l : Literal) : Written :=
+  if l.positive then l.atom.written else .not l.atom.written
+
+/-- A clause as written. -/
+def Clause.written (c : Clause) : Written :=
+  let body := if c.lits.isEmpty then .false else .or (c.lits.map Literal.written)
+  if c.vars.isEmpty then body else .forall (c.vars.mapIdx fun i s ↦ (varName i, s)) body
+
+/-- A literal as a Lean term. -/
+def Literal.toTerm [Monad m] [MonadQuotation m] (l : Literal) : m Term := l.written.toTerm
+
+/-- A clause as a Lean term. -/
+def Clause.toTerm [Monad m] [MonadQuotation m] (c : Clause) : m Term := c.written.toTerm
+
+/-- A clause as text, ready to paste into a module. -/
+def Clause.toString (c : Clause) : String := c.written.toString
 
 instance : ToString Clause := ⟨Clause.toString⟩
+
+/-- A numeral of a numeric sort as a term, `(3 : Int)`. -/
+def numeralTerm [Monad m] [MonadQuotation m] (sort : SortName) (n : Int) : m Term :=
+  (Written.numeral sort n).toTerm
+
+namespace FinStructure
+
+/-- Element `i` of sort `s` as text: its constructor for an enum sort, its index otherwise. -/
+def elementName (m : FinStructure) (s : SortName) (i : Nat) : String :=
+  match m.enumCtor? s i with
+  | some c => c.toString
+  | none => ToString.toString i
+
+/-- A structure as text: its sorts, then one line per symbol. A relation is the set of its tuples,
+a 0-ary relation `true` or `false`, and a function the rows `(args)↦value`. -/
+def render (m : FinStructure) : String :=
+  let names (sorts : Array SortName) (t : Array Nat) : List String :=
+    ((sorts.zip t).map fun (s, i) ↦ m.elementName s i).toList
+  let row (args : List String) (value : String) : String :=
+    if args.isEmpty then value else "(" ++ ",".intercalate args ++ ")↦" ++ value
+  let sorts := ", ".intercalate <| m.sorts.toList.map fun (s, n) ↦
+    match m.enums.find? (·.1 == s) with
+    | some (_, ctors) => s!"{s} = \{{", ".intercalate (ctors.toList.map (·.toString))}}"
+    | none => s!"{s} = Fin {n}"
+  let rels := m.rels.toList.map fun (sym, tuples) ↦
+    let table :=
+      if sym.isFunction then
+        " ".intercalate <| tuples.toList.map fun t ↦
+          let ns := names sym.argSorts t
+          row ns.dropLast (ns.getLast?.getD "?")
+      else if sym.argSorts.isEmpty then if tuples.isEmpty then "false" else "true"
+      else if tuples.isEmpty then "∅"
+      else " ".intercalate <| tuples.toList.map fun t ↦
+        "(" ++ ",".intercalate (names sym.argSorts t) ++ ")"
+    s!"    {sym.key}: {table}"
+  let nums := m.nums.toList.map fun (sym, table) ↦
+    let rows := table.toList.map fun (t, v) ↦ row (names sym.argSorts.pop t) (ToString.toString v)
+    s!"    {sym.key}: {" ".intercalate rows}"
+  s!"    sorts: {sorts}\n" ++ "\n".intercalate (rels ++ nums)
+
+end FinStructure
 
 end Veil.Synthesizer

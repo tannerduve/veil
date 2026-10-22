@@ -4,20 +4,16 @@ public import Veil
 public import Veil.Core.Tools.Synthesizer.Soundness
 public meta import Veil.Core.Tools.Synthesizer.Command
 
-/-! # Invariant synthesis
+/-!
+# Invariant synthesis
 
-`#synthesize_invariants`, run after `#gen_spec` inside a Veil module, either
-finds universal `invariant` clauses that make the module's `safety` properties
-inductive, or finds an execution that violates them. With `certify`, either
-answer becomes a kernel-checked theorem in the module's namespace: `ic3_safe`
-or `ic3_unsafe`.
+`#synthesize_invariants`, run after `#gen_spec` in a Veil module, finds universal `invariant`
+clauses that make the module's `safety` properties inductive, finds an execution that violates
+them, or reports that no universal inductive invariant exists. With `certify`, an invariant or an
+execution becomes a kernel-checked theorem, `ic3_safe` or `ic3_unsafe`. The search is UPDR, the
+first-order form of IC3 [Karbyshev et al.]. See `docs/Invariant-Synthesis.md` for usage.
 
-The search is UPDR, the first-order form of IC3, from Karbyshev, Bjørner,
-Itzhaky, Rinetzky and Shoham, "Property-Directed Inference of Universal
-Invariants or Proving Their Absence", JACM 2017. See
-`docs/InvariantSynthesis.md` for usage, options and limitations.
-
-The command is not part of `import Veil`; import this module to use it:
+The command is not part of `import Veil`:
 
 ```lean
 module
@@ -26,19 +22,20 @@ public import Veil
 public import Veil.Core.Tools.Synthesizer
 ```
 
-The modules, in dependency order:
+## Structure
 
-* `Clause`: universal clauses and finite structures as data; diagrams and
-  subsumption.
-* `Linear`: candidate linear relations between integer individuals.
+* `Clause`, `Structure`: universal clauses, finite structures and diagrams.
+* `Linear`: linear relations between integer individuals, as candidate clauses.
 * `Render`: clauses as Veil terms and as text.
-* `Vocabulary`: the module's symbols, and solver models read as finite
-  structures.
-* `Query`: the solver queries, posed through Veil's tactic pipeline, and the
-  normalized transition relation.
-* `Controller`: the UPDR loop.
-* `Soundness`: the reachability lemmas the certificates use.
-* `Certificate`: the safety theorem `ic3_safe`.
-* `Counterexample`: the refutation theorem `ic3_unsafe`.
-* `Command`: the `#synthesize_invariants` command.
+* `Vocabulary`, `Model`: the symbols of a module, and solver models read as structures.
+* `Query`, `TrNorm`, `Solver`: the solver queries and Veil's pipeline that discharges them.
+* `Search`, `Generalize`, `Controller`: the UPDR loop.
+* `Soundness`: the facts about transition systems the certificates apply.
+* `Certificate`, `Counterexample`: the certificates.
+* `Command`: the command.
+
+## References
+
+* A. Karbyshev, N. Bjørner, S. Itzhaky, N. Rinetzky, S. Shoham, *Property-Directed Inference of
+  Universal Invariants or Proving Their Absence*, Journal of the ACM 64(1), 2017.
 -/
